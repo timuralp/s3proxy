@@ -19,15 +19,19 @@ package org.gaul.s3proxy;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.io.PushbackInputStream;
+import java.io.UnsupportedEncodingException;
 import java.io.Writer;
 import java.net.URLDecoder;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.security.InvalidKeyException;
+import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -45,6 +49,7 @@ import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
+import javax.xml.bind.DatatypeConverter;
 import javax.xml.stream.XMLInputFactory;
 import javax.xml.stream.XMLOutputFactory;
 import javax.xml.stream.XMLStreamConstants;
@@ -52,6 +57,7 @@ import javax.xml.stream.XMLStreamException;
 import javax.xml.stream.XMLStreamReader;
 import javax.xml.stream.XMLStreamWriter;
 
+import com.google.common.base.Joiner;
 import com.google.common.base.Optional;
 import com.google.common.base.Strings;
 import com.google.common.base.Throwables;
@@ -224,41 +230,42 @@ final class S3ProxyHandler extends AbstractHandler {
         }
 
         if (identity != null) {
-            String expectedSignature = createAuthorizationSignature(request,
-                    uri, identity, credential);
             String headerAuthorization = request.getHeader(
                     HttpHeaders.AUTHORIZATION);
-            String headerIdentity = null;
-            String headerSignature = null;
-            if (headerAuthorization != null &&
-                    headerAuthorization.startsWith("AWS ")) {
-                String[] values =
-                        headerAuthorization.substring(4).split(":", 2);
-                if (values.length != 2) {
+            S3AuthorizationHeader authHeader = null;
+            try {
+                authHeader = new S3AuthorizationHeader(headerAuthorization);
+            } catch (IllegalArgumentException e) {
+                sendSimpleErrorResponse(response, S3ErrorCode.INVALID_ARGUMENT);
+                baseRequest.setHandled(true);
+                return;
+            }
+            String expectedSignature = null;
+            if (authHeader.hmacAlgorithm == null) {
+                expectedSignature = createAuthorizationSignature(request,
+                        uri, identity, credential);
+            } else {
+                try {
+                    expectedSignature = createAuthorizationSignatureV4(
+                            baseRequest, uri, credential);
+                } catch (InvalidKeyException|NoSuchAlgorithmException e) {
                     sendSimpleErrorResponse(response,
                             S3ErrorCode.INVALID_ARGUMENT);
                     baseRequest.setHandled(true);
                     return;
                 }
-                headerIdentity = values[0];
-                headerSignature = values[1];
-            } else if (headerAuthorization != null &&
-                    headerAuthorization.startsWith("AWS4-HMAC-SHA256 ")) {
-                // Fail V4 signature requests to allow clients to retry with V2.
-                sendSimpleErrorResponse(response, S3ErrorCode.INVALID_ARGUMENT);
-                baseRequest.setHandled(true);
-                return;
             }
+
             String parameterIdentity = request.getParameter("AWSAccessKeyId");
             String parameterSignature = request.getParameter("Signature");
 
-            if (headerIdentity != null && headerSignature != null) {
-                if (!identity.equals(headerIdentity)) {
+            if (authHeader.identity != null && authHeader.signature != null) {
+                if (!identity.equals(authHeader.identity)) {
                     sendSimpleErrorResponse(response,
                             S3ErrorCode.INVALID_ACCESS_KEY_ID);
                     baseRequest.setHandled(true);
                     return;
-                } else if (!expectedSignature.equals(headerSignature)) {
+                } else if (!expectedSignature.equals(authHeader.signature)) {
                     sendSimpleErrorResponse(response,
                             S3ErrorCode.SIGNATURE_DOES_NOT_MATCH);
                     baseRequest.setHandled(true);
@@ -1330,7 +1337,7 @@ final class S3ProxyHandler extends AbstractHandler {
 
     /**
      * Create Amazon V2 signature.  Reference:
-     * http://docs.aws.amazon.com/AmazonS3/latest/dev/RESTAuthentication.html
+     * http://docs.aws.amazon.com/general/latest/gr/signature-version-2.html
      */
     private static String createAuthorizationSignature(
             HttpServletRequest request, String uri, String identity,
@@ -1407,6 +1414,148 @@ final class S3ProxyHandler extends AbstractHandler {
         }
         return BaseEncoding.base64().encode(mac.doFinal(
                 stringToSign.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    /**
+     * Create v4 signature:
+     * http://docs.aws.amazon.com/general/latest/gr/signature-version-4.html
+     */
+    private static String createAuthorizationSignatureV4(Request request,
+            String uri, String credential) throws
+            InvalidKeyException, IOException, NoSuchAlgorithmException {
+        byte [] payload = getPayload(request);
+        S3AuthorizationHeader authHeader = new S3AuthorizationHeader(request.
+                getHeader("Authorization"));
+        String canonicalRequest = createCanonicalRequest(request, uri, payload,
+                authHeader.hashAlgorithm);
+        String algorithm = authHeader.hmacAlgorithm;
+        List<String> stringToSignParts = new ArrayList<>();
+        stringToSignParts.add("AWS4-HMAC-SHA256");
+        stringToSignParts.add(getTimeStamp(request));
+        String [] scopeParts = { authHeader.date, authHeader.region, "s3",
+                "aws4_request" };
+        stringToSignParts.add(Joiner.on("/").join(scopeParts));
+        stringToSignParts.add(canonicalRequest);
+        byte[] dateKey = signMessage(authHeader.date.getBytes("UTF8"),
+                ("AWS4" + credential).getBytes("UTF8"), algorithm);
+        byte[] dateRegionKey = signMessage(authHeader.region.getBytes("UTF8"),
+                dateKey,
+                algorithm);
+        byte[] dateRegionServiceKey = signMessage(authHeader.service.
+                getBytes("UTF8"), dateRegionKey, algorithm);
+        byte[] signingKey = signMessage("aws4_request".getBytes("UTF8"),
+                dateRegionServiceKey, algorithm);
+        byte[] signature = signMessage(Joiner.on("\n").join(stringToSignParts).
+                getBytes("UTF8"), signingKey, algorithm);
+        return DatatypeConverter.printHexBinary(signature).toLowerCase();
+    }
+
+    private static byte[] signMessage(byte[] data, byte[] key, String algorithm)
+            throws InvalidKeyException, NoSuchAlgorithmException {
+        Mac mac = Mac.getInstance(algorithm);
+        mac.init(new SecretKeySpec(key, algorithm));
+        return mac.doFinal(data);
+    }
+
+    private static String getTimeStamp(Request request) {
+        for (String header : Collections.list(request.getHeaderNames())) {
+            if (header.toLowerCase().startsWith("x-amz-date")) {
+                return request.getHeader(header);
+            }
+        }
+        return null;
+    }
+
+    private static String createCanonicalRequest(Request request, String uri,
+            byte[] payload, String hashAlgorithm) throws IOException,
+            NoSuchAlgorithmException {
+        List<String> canonicalRequestParts = new ArrayList<>();
+        String authorizationHeader = request.getHeader("Authorization");
+        String[] signedHeaders = extractSignedHeaders(authorizationHeader);
+        canonicalRequestParts.add(request.getMethod());
+        canonicalRequestParts.add(uri);
+        canonicalRequestParts.add(buildCanonicalQueryString(request));
+        canonicalRequestParts.add(buildCanonicalHeaders(request, signedHeaders)
+                + "\n");
+        canonicalRequestParts.add(Joiner.on(';').join(signedHeaders));
+        canonicalRequestParts.add(getMessageDigest(payload, hashAlgorithm));
+        String canonicalRequest = Joiner.on("\n").join(canonicalRequestParts);
+        return getMessageDigest(canonicalRequest.getBytes("UTF8"),
+                hashAlgorithm);
+    }
+
+    private static String getMessageDigest(byte[] payload, String algorithm)
+            throws NoSuchAlgorithmException {
+        MessageDigest md = MessageDigest.getInstance(algorithm);
+        byte[] hash = md.digest(payload);
+        return DatatypeConverter.printHexBinary(hash).toLowerCase();
+    }
+
+    private static String[] extractSignedHeaders(String authorization) {
+        int index = authorization.indexOf("SignedHeaders=");
+        if (index < 0) {
+            return null;
+        }
+        int endSigned = authorization.indexOf(',', index);
+        if (endSigned < 0) {
+            return null;
+        }
+        int startHeaders = authorization.indexOf('=', index);
+        return authorization.substring(startHeaders + 1, endSigned).split(";");
+    }
+
+    private static String buildCanonicalHeaders(Request request,
+            String[] signedHeaders) {
+        List<String> headers = new ArrayList<>();
+        for (String header : signedHeaders) {
+            headers.add(header.toLowerCase());
+        }
+        Collections.sort(headers);
+        Joiner result = Joiner.on("\n");
+        List<String> headersWithValues = new ArrayList<>();
+        for(String header : headers) {
+            List<String> values = new ArrayList<>();
+            StringBuilder headerWithValue = new StringBuilder();
+            headerWithValue.append(header);
+            headerWithValue.append(":");
+            for (String value : Collections.list(request.getHeaders(header))) {
+                value = value.trim();
+                if (!value.startsWith("\"")) {
+                    value = value.replaceAll("\\s+", " ");
+                }
+                values.add(value);
+            }
+            Joiner valuesJoiner = Joiner.on(",");
+            headerWithValue.append(valuesJoiner.join(values));
+            headersWithValues.add(headerWithValue.toString());
+        }
+
+        return result.join(headersWithValues);
+    }
+
+    private static byte[] getPayload(Request request) throws IOException {
+        ByteArrayOutputStream byteStream = new ByteArrayOutputStream();
+        try(InputStream requestStream = request.getInputStream()) {
+            ByteStreams.copy(requestStream, byteStream);
+        }
+        return byteStream.toByteArray();
+    }
+
+    private static String buildCanonicalQueryString(Request request) throws
+            UnsupportedEncodingException {
+        // The parameters are required to be sorted
+        List<String> parameters = Collections.list(request.getParameterNames());
+        Collections.sort(parameters);
+        List<String> queryParameters = new ArrayList<>();
+        for (String key : parameters) {
+            // The parameters are decoded by default, so we need to re-encode
+            // them
+            String value = request.getParameter(key);
+            queryParameters.add(URLEncoder.encode(key,
+                    request.getQueryEncoding()) + "=" + URLEncoder.encode(value,
+                    request.getQueryEncoding()));
+        }
+        return Joiner.on("&").join(queryParameters);
     }
 
     private Collection<String> parseSimpleXmlElements(InputStream is,

@@ -19,13 +19,21 @@ package org.gaul.s3proxy;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assert.fail;
 
+import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.net.URI;
+import java.util.List;
 import java.util.Properties;
 import java.util.Random;
 
 import javax.servlet.http.HttpServletResponse;
 
+import com.amazonaws.auth.AWSCredentials;
+import com.amazonaws.auth.BasicAWSCredentials;
+import com.amazonaws.services.s3.AmazonS3;
+import com.amazonaws.services.s3.AmazonS3Client;
+import com.amazonaws.services.s3.model.Bucket;
+import com.amazonaws.services.s3.model.S3Object;
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
@@ -399,6 +407,19 @@ public final class S3ProxyTest {
             assertThat(hre.getResponse().getStatusCode()).isEqualTo(
                     HttpServletResponse.SC_NOT_IMPLEMENTED);
         }
+    }
+
+    @Test
+    public void testV4Signature() throws Exception {
+        AWSCredentials creds = new BasicAWSCredentials("local-identity", "local-credential");
+
+        AmazonS3 conn = new AmazonS3Client(creds);
+        conn.setEndpoint(s3Endpoint.toString());
+        List<Bucket> bucketList = conn.listBuckets();
+        String objectContents = "value";
+        conn.putObject(containerName, "foo",
+                new ByteArrayInputStream(objectContents.getBytes()), null);
+        S3Object object = conn.getObject(containerName, "foo");
     }
 
     private static String createRandomContainerName() {
